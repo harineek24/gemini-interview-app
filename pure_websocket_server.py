@@ -724,6 +724,90 @@ HTML_CONTENT = """
                 }
             }
 
+            // FIXED: Buffer audio chunks instead of playing immediately
+            bufferAudioChunk(base64Audio) {
+                try {
+                    const audioData = atob(base64Audio);
+                    const uint8Array = new Uint8Array(audioData.length);
+                    
+                    for (let i = 0; i < audioData.length; i++) {
+                        uint8Array[i] = audioData.charCodeAt(i);
+                    }
+                    
+                    this.audioBuffer.push(uint8Array);
+                    console.log(`Buffered audio chunk: ${uint8Array.length} bytes (total: ${this.audioBuffer.length} chunks)`);
+                    
+                } catch (error) {
+                    console.error('Error buffering audio chunk:', error);
+                }
+            }
+
+            // FIXED: Play all buffered audio as one smooth stream
+            playBufferedAudio() {
+                if (this.audioBuffer.length === 0) {
+                    console.log('No audio to play');
+                    return;
+                }
+
+                if (this.isPlayingAudio) {
+                    console.log('Already playing audio, skipping...');
+                    return;
+                }
+
+                try {
+                    console.log(`Playing ${this.audioBuffer.length} buffered audio chunks`);
+                    this.isPlayingAudio = true;
+                    
+                    // Concatenate all audio chunks
+                    const totalLength = this.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+                    const combinedAudio = new Uint8Array(totalLength);
+                    
+                    let offset = 0;
+                    for (const chunk of this.audioBuffer) {
+                        combinedAudio.set(chunk, offset);
+                        offset += chunk.length;
+                    }
+                    
+                    // Convert to WAV and play
+                    const wavBuffer = this.createWAVFromPCM(combinedAudio, 24000);
+                    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
+                    const audioUrl = URL.createObjectURL(blob);
+                    
+                    // Stop any current playback
+                    if (!this.audioPlayer.paused) {
+                        this.audioPlayer.pause();
+                    }
+                    
+                    this.audioPlayer.src = audioUrl;
+                    this.audioPlayer.play().then(() => {
+                        console.log('Audio playback started successfully');
+                    }).catch(err => {
+                        console.warn('Audio playback failed:', err);
+                    });
+                    
+                    // Clean up after playing
+                    this.audioPlayer.onended = () => {
+                        URL.revokeObjectURL(audioUrl);
+                        this.isPlayingAudio = false;
+                        this.audioBuffer = []; // Clear buffer
+                        console.log('Audio playback completed');
+                    };
+                    
+                    // Handle errors
+                    this.audioPlayer.onerror = () => {
+                        URL.revokeObjectURL(audioUrl);
+                        this.isPlayingAudio = false;
+                        this.audioBuffer = [];
+                        console.error('Audio playback error');
+                    };
+                    
+                } catch (error) {
+                    console.error('Error playing buffered audio:', error);
+                    this.isPlayingAudio = false;
+                    this.audioBuffer = [];
+                }
+            }
+
             createWAVFromPCM(pcmData, sampleRate) {
                 const length = pcmData.length;
                 const buffer = new ArrayBuffer(44 + length);
