@@ -299,7 +299,7 @@ class WorkingGeminiLiveHandler:
                     await self.websocket.send(json.dumps({
                         'type': 'audio_stream_start',
                         'stream_id': current_stream_id,
-                        'sample_rate': 24000,
+                        'sample_rate': 16000,  # Fixed: Match client sample rate
                         'format': 'pcm_16'
                     }))
                 
@@ -512,6 +512,10 @@ HTML_CONTENT = """
                 this.isRecording = false;
                 this.audioChunkCount = 0;
                 this.responseCount = 0;
+                this.audioBuffer = [];
+                this.currentStreamId = null;
+                this.isPlayingAudio = false;
+                this.audioTimeout = null;
                 
                 this.initializeElements();
                 this.initializeEventListeners();
@@ -666,15 +670,42 @@ HTML_CONTENT = """
 
                     case 'audio_stream_start':
                         console.log('Audio stream starting');
+                        this.currentStreamId = data.stream_id;
+                        this.audioBuffer = []; // Reset buffer for new stream
+                        this.isPlayingAudio = false; // Reset playing state
                         break;
                         
                     case 'audio_chunk_response':
-                        // Buffer and play audio
-                        this.playAudio(data.audio);
+                        if (data.stream_id === this.currentStreamId) {
+                            this.bufferAudioChunk(data.audio);
+                            
+                            // Clear any existing timeout
+                            if (this.audioTimeout) {
+                                clearTimeout(this.audioTimeout);
+                            }
+                            
+                            // Auto-play after accumulating enough audio (prevent infinite buffering)
+                            if (this.audioBuffer.length >= 3) { // Further reduced for more responsive audio
+                                this.playBufferedAudio();
+                            } else {
+                                // Set timeout to play audio even if stream end is missed
+                                this.audioTimeout = setTimeout(() => {
+                                    if (this.audioBuffer.length > 0) {
+                                        console.log('Audio timeout - playing buffered audio');
+                                        this.playBufferedAudio();
+                                    }
+                                }, 500); // Further reduced timeout for more responsive audio
+                            }
+                        }
                         break;
                         
                     case 'audio_stream_end':
                         console.log('Audio stream ended');
+                        if (this.audioTimeout) {
+                            clearTimeout(this.audioTimeout);
+                            this.audioTimeout = null;
+                        }
+                        this.playBufferedAudio();
                         break;
 
                     case 'interview_ended':
@@ -703,25 +734,10 @@ HTML_CONTENT = """
                 this.transcripts.scrollTop = this.transcripts.scrollHeight;
             }
 
+            // DEPRECATED: This function causes choppy audio - now using buffering instead
             playAudio(base64Audio) {
-                try {
-                    const audioData = atob(base64Audio);
-                    const uint8Array = new Uint8Array(audioData.length);
-                    
-                    for (let i = 0; i < audioData.length; i++) {
-                        uint8Array[i] = audioData.charCodeAt(i);
-                    }
-                    
-                    const wavBuffer = this.createWAVFromPCM(uint8Array, 24000);
-                    const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(blob);
-                    
-                    this.audioPlayer.src = audioUrl;
-                    this.audioPlayer.play();
-                    
-                } catch (error) {
-                    console.error('Error playing audio:', error);
-                }
+                // This function is no longer used - kept for compatibility
+                console.warn('playAudio called but buffering system should be used instead');
             }
 
             // FIXED: Buffer audio chunks instead of playing immediately
@@ -742,69 +758,60 @@ HTML_CONTENT = """
                 }
             }
 
-            // FIXED: Play all buffered audio as one smooth stream
+            // Revamped: Play buffered audio with a proper queueing system to prevent jitter
             playBufferedAudio() {
-                if (this.audioBuffer.length === 0) {
-                    console.log('No audio to play');
+                if (this.audioBuffer.length === 0 || this.isPlayingAudio) {
                     return;
                 }
 
-                if (this.isPlayingAudio) {
-                    console.log('Already playing audio, skipping...');
-                    return;
-                }
+                const chunksToPlay = this.audioBuffer;
+                this.audioBuffer = [];
 
                 try {
-                    console.log(`Playing ${this.audioBuffer.length} buffered audio chunks`);
+                    console.log(`Playing ${chunksToPlay.length} audio chunks...`);
                     this.isPlayingAudio = true;
                     
-                    // Concatenate all audio chunks
-                    const totalLength = this.audioBuffer.reduce((sum, chunk) => sum + chunk.length, 0);
+                    const totalLength = chunksToPlay.reduce((sum, chunk) => sum + chunk.length, 0);
                     const combinedAudio = new Uint8Array(totalLength);
                     
                     let offset = 0;
-                    for (const chunk of this.audioBuffer) {
+                    for (const chunk of chunksToPlay) {
                         combinedAudio.set(chunk, offset);
                         offset += chunk.length;
                     }
                     
-                    // Convert to WAV and play
-                    const wavBuffer = this.createWAVFromPCM(combinedAudio, 24000);
+                    const wavBuffer = this.createWAVFromPCM(combinedAudio, 16000);
                     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
                     const audioUrl = URL.createObjectURL(blob);
                     
-                    // Stop any current playback
-                    if (!this.audioPlayer.paused) {
-                        this.audioPlayer.pause();
-                    }
-                    
                     this.audioPlayer.src = audioUrl;
-                    this.audioPlayer.play().then(() => {
-                        console.log('Audio playback started successfully');
-                    }).catch(err => {
-                        console.warn('Audio playback failed:', err);
-                    });
                     
-                    // Clean up after playing
                     this.audioPlayer.onended = () => {
                         URL.revokeObjectURL(audioUrl);
                         this.isPlayingAudio = false;
-                        this.audioBuffer = []; // Clear buffer
-                        console.log('Audio playback completed');
+                        if (this.audioBuffer.length > 0) {
+                            this.playBufferedAudio();
+                        }
                     };
                     
-                    // Handle errors
-                    this.audioPlayer.onerror = () => {
+                    this.audioPlayer.onerror = (e) => {
                         URL.revokeObjectURL(audioUrl);
                         this.isPlayingAudio = false;
-                        this.audioBuffer = [];
-                        console.error('Audio playback error');
+                        console.error("Audio playback error:", e);
+                        if (this.audioBuffer.length > 0) {
+                            this.playBufferedAudio();
+                        }
                     };
                     
+                    this.audioPlayer.play().catch(e => {
+                        console.error("Error starting audio playback:", e);
+                        this.isPlayingAudio = false;
+                        this.audioPlayer.onerror(e); // Trigger error handling
+                    });
+
                 } catch (error) {
                     console.error('Error playing buffered audio:', error);
                     this.isPlayingAudio = false;
-                    this.audioBuffer = [];
                 }
             }
 
