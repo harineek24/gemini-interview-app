@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Complete Working WebSocket Server for Gemini Live Interview
+Complete Working WebSocket Server for Gemini Live Interview with Speech Recognition
 """
 
 import asyncio
@@ -20,9 +20,7 @@ from socketserver import TCPServer
 
 # Import dependencies for the handler
 from dotenv import load_dotenv
-from google import genai
-import google.generativeai as genai_summary
-from google.genai import types
+from pure_gemini_handler import PureGeminiHandler
 
 # Load environment variables
 load_dotenv()
@@ -31,430 +29,7 @@ load_dotenv()
 interviews_db = {}
 transcripts_db = {}
 
-class SimpleInterview:
-    def __init__(self):
-        self.id = str(uuid.uuid4())
-        self.status = 'active'
-        self.started_at = datetime.now()
-        self.ended_at = None
-        self.duration_seconds = 0
-        self.full_transcript = ""
-        self.summary = ""
-    
-    @property
-    def duration_formatted(self):
-        minutes = self.duration_seconds // 60
-        seconds = self.duration_seconds % 60
-        return f"{minutes}:{seconds:02d}"
-
-class SimpleTranscript:
-    def __init__(self, interview_id: str, speaker: str, text: str, sequence: int):
-        self.id = str(uuid.uuid4())
-        self.interview_id = interview_id
-        self.speaker = speaker
-        self.text = text
-        self.sequence_number = sequence
-        self.timestamp = datetime.now()
-
-class WorkingGeminiLiveHandler:
-    def __init__(self, websocket, interviews_db: dict, transcripts_db: dict):
-        self.websocket = websocket
-        self.interview: Optional[SimpleInterview] = None
-        self.interviews_db = interviews_db
-        self.transcripts_db = transcripts_db
-        
-        # Get API key from environment
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY environment variable not set")
-            
-        # Use v1alpha API version for Live API
-        self.client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
-        self.model = "gemini-2.5-flash-preview-native-audio-dialog"
-        self.transcript_counter = 0
-        self.session = None
-        self.conversation_inactive_threshold = 60  # Increased to 60 seconds
-        self.last_activity = None
-        
-        # Audio streaming improvements
-        self.audio_buffer = asyncio.Queue()
-        self.last_audio_time = None
-        self.silence_threshold = 1.5  # seconds
-        self.is_session_active = True
-        self.pending_audio_chunks = []
-        self.audio_chunk_timeout = 0.2  # 200ms buffer
-        
-    async def start_interview(self):
-        """Initialize the interview and start the Gemini Live session"""
-        try:
-            # Create new interview record
-            self.interview = SimpleInterview()
-            self.interviews_db[self.interview.id] = self.interview
-            
-            await self.websocket.send(json.dumps({
-                'type': 'interview_started',
-                'interview_id': str(self.interview.id)
-            }))
-            
-            # Config for continuous conversation
-            config = types.LiveConnectConfig(
-                response_modalities=["AUDIO"],
-                system_instruction="""You are a professional AI interviewer. Start by greeting the interviewee and asking them to introduce themselves. Then ask follow-up questions about their background, experience, and goals. Keep the conversation natural and engaging. Speak clearly and at a moderate pace.""",
-                input_audio_transcription={}
-            )
-            
-            # Start Gemini Live session
-            async with self.client.aio.live.connect(model=self.model, config=config) as session:
-                self.session = session
-                self.last_activity = datetime.now()
-                self.is_session_active = True
-                
-                print("✅ Gemini Live session started successfully")
-                
-                # Send initial greeting
-                await session.send_realtime_input(
-                    text="Hello! Welcome to this interview. Please start by introducing yourself and telling me a bit about your background."
-                )
-                
-                # Start all tasks
-                tasks = [
-                    asyncio.create_task(self.handle_gemini_responses()),
-                    asyncio.create_task(self.handle_client_messages()),
-                    asyncio.create_task(self.audio_sender()),
-                    asyncio.create_task(self.audio_streamer()),
-                    asyncio.create_task(self.monitor_inactivity())
-                ]
-                
-                try:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                except Exception as e:
-                    print(f"Error in session tasks: {e}")
-                finally:
-                    self.is_session_active = False
-                    await self.end_interview()
-                    
-        except Exception as e:
-            print(f"Error connecting to Gemini: {e}")
-            traceback.print_exc()
-            raise e
-
-    async def handle_client_messages(self):
-        """Handle messages from the client (user audio/commands)"""
-        try:
-            async for message in self.websocket:
-                if not self.is_session_active:
-                    break
-                    
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    print("Invalid JSON received from client")
-                    continue
-                
-                if data['type'] == 'audio_chunk':
-                    try:
-                        audio_data = base64.b64decode(data['audio'])
-                        if len(audio_data) > 32:  # Only process meaningful audio
-                            self.pending_audio_chunks.append(audio_data)
-                            self.last_audio_time = time.time()
-                            self.last_activity = datetime.now()
-                            
-                    except Exception as e:
-                        print(f"Error processing audio chunk: {e}")
-                    
-                elif data['type'] == 'stop_interview':
-                    print("🛑 User requested interview stop")
-                    self.is_session_active = False
-                    break
-                    
-        except websockets.exceptions.ConnectionClosed:
-            print("Client disconnected")
-        except Exception as e:
-            print(f"Error handling client messages: {e}")
-        finally:
-            self.is_session_active = False
-    
-    async def audio_sender(self):
-        """Send audio to Gemini with batching"""
-        while self.is_session_active:
-            try:
-                # Check if we have pending audio and enough time has passed
-                if (self.pending_audio_chunks and self.last_audio_time and 
-                    time.time() - self.last_audio_time > self.audio_chunk_timeout):
-                    
-                    # Combine chunks
-                    combined_audio = b''.join(self.pending_audio_chunks)
-                    self.pending_audio_chunks.clear()
-                    
-                    if len(combined_audio) > 0:
-                        await self.send_audio_to_gemini(combined_audio)
-                
-                # Send stream end after silence
-                elif (self.last_audio_time and 
-                      time.time() - self.last_audio_time > self.silence_threshold):
-                    await self.send_audio_stream_end()
-                    self.last_audio_time = None
-                
-                await asyncio.sleep(0.05)
-                
-            except Exception as e:
-                print(f"Error in audio sender: {e}")
-                await asyncio.sleep(0.1)
-    
-    async def handle_gemini_responses(self):
-        """Handle responses from Gemini Live API"""
-        try:
-            async for response in self.session.receive():
-                if not self.is_session_active:
-                    break
-                    
-                if hasattr(response, 'server_content') and response.server_content:
-                    
-                    # Handle input transcription (user speech)
-                    if (hasattr(response.server_content, 'input_transcription') and 
-                        response.server_content.input_transcription and
-                        hasattr(response.server_content.input_transcription, 'text')):
-                        
-                        user_text = response.server_content.input_transcription.text
-                        if user_text and user_text.strip():
-                            print(f"👤 User said: {user_text}")
-                            await self.save_live_transcript('user', user_text)
-                            await self.websocket.send(json.dumps({
-                                'type': 'live_transcript',
-                                'speaker': 'user',
-                                'text': user_text
-                            }))
-                    
-                    # Handle interruptions
-                    if (hasattr(response.server_content, 'interrupted') and 
-                        response.server_content.interrupted):
-                        print("🤚 AI response interrupted")
-                        # Clear audio buffer
-                        while not self.audio_buffer.empty():
-                            try:
-                                self.audio_buffer.get_nowait()
-                            except:
-                                break
-                    
-                    # Handle model responses
-                    if (hasattr(response.server_content, 'model_turn') and 
-                        response.server_content.model_turn and
-                        hasattr(response.server_content.model_turn, 'parts')):
-                        
-                        for part in response.server_content.model_turn.parts:
-                            # Handle text responses
-                            if hasattr(part, 'text') and part.text and part.text.strip():
-                                ai_text = part.text.strip()
-                                print(f"🤖 AI said: {ai_text}")
-                                await self.save_live_transcript('ai', ai_text)
-                                await self.websocket.send(json.dumps({
-                                    'type': 'live_transcript',
-                                    'speaker': 'ai',
-                                    'text': ai_text
-                                }))
-                            
-                            # Handle audio responses
-                            if (hasattr(part, 'inline_data') and 
-                                part.inline_data and 
-                                hasattr(part.inline_data, 'data') and
-                                part.inline_data.data):
-                                
-                                await self.audio_buffer.put({
-                                    'data': part.inline_data.data,
-                                    'mime_type': getattr(part.inline_data, 'mime_type', 'audio/pcm')
-                                })
-                    
-                    # Handle turn complete
-                    if (hasattr(response.server_content, 'turn_complete') and 
-                        response.server_content.turn_complete):
-                        print("✅ AI turn complete")
-                        await self.audio_buffer.put({'end_turn': True})
-                    
-                    self.last_activity = datetime.now()
-                    
-        except Exception as e:
-            print(f"Error handling Gemini responses: {e}")
-            traceback.print_exc()
-    
-    async def audio_streamer(self):
-        """Stream audio to client with proper buffering"""
-        current_stream_id = None
-        
-        while self.is_session_active:
-            try:
-                audio_item = await asyncio.wait_for(self.audio_buffer.get(), timeout=0.1)
-                
-                if audio_item.get('end_turn'):
-                    if current_stream_id:
-                        await self.websocket.send(json.dumps({
-                            'type': 'audio_stream_end',
-                            'stream_id': current_stream_id
-                        }))
-                        current_stream_id = None
-                    continue
-                
-                # Start new audio stream
-                if not current_stream_id:
-                    current_stream_id = str(uuid.uuid4())
-                    await self.websocket.send(json.dumps({
-                        'type': 'audio_stream_start',
-                        'stream_id': current_stream_id,
-                        'sample_rate': 16000,  # Fixed: Match client sample rate
-                        'format': 'pcm_16'
-                    }))
-                
-                # Send audio chunk
-                audio_b64 = base64.b64encode(audio_item['data']).decode()
-                await self.websocket.send(json.dumps({
-                    'type': 'audio_chunk_response',
-                    'stream_id': current_stream_id,
-                    'audio': audio_b64,
-                    'mime_type': audio_item.get('mime_type', 'audio/pcm')
-                }))
-                
-            except asyncio.TimeoutError:
-                continue
-            except websockets.exceptions.ConnectionClosed:
-                break
-            except Exception as e:
-                print(f"Error in audio streamer: {e}")
-                await asyncio.sleep(0.1)
-    
-    async def send_audio_to_gemini(self, audio_data: bytes):
-        """Send audio data to Gemini Live API"""
-        try:
-            if len(audio_data) == 0:
-                return
-                
-            # Send audio
-            await self.session.send_realtime_input(
-                audio=types.Blob(
-                    data=audio_data,
-                    mime_type="audio/pcm;rate=16000"
-                )
-            )
-            
-        except Exception as e:
-            print(f"Error sending audio to Gemini: {e}")
-
-    async def send_audio_stream_end(self):
-        """Send audio stream end to flush cached audio"""
-        try:
-            await self.session.send_realtime_input(audio_stream_end=True)
-            print("📤 Sent audio stream end")
-        except Exception as e:
-            print(f"Error sending audio stream end: {e}")
-
-    async def save_live_transcript(self, speaker: str, text: str):
-        """Save live transcript"""
-        try:
-            if self.interview and text.strip():
-                transcript = SimpleTranscript(
-                    self.interview.id, 
-                    speaker, 
-                    text.strip(), 
-                    self.transcript_counter
-                )
-                self.transcripts_db[transcript.id] = transcript
-                self.transcript_counter += 1
-                
-        except Exception as e:
-            print(f"Error saving transcript: {e}")
-    
-    async def monitor_inactivity(self):
-        """Monitor for conversation inactivity"""
-        while self.is_session_active:
-            try:
-                await asyncio.sleep(5)
-                
-                if self.last_activity:
-                    inactive_seconds = (datetime.now() - self.last_activity).total_seconds()
-                    
-                    if inactive_seconds > self.conversation_inactive_threshold:
-                        print(f"⏰ Conversation inactive for {inactive_seconds:.1f}s")
-                        self.is_session_active = False
-                        break
-                        
-            except Exception as e:
-                print(f"Error in inactivity monitor: {e}")
-                await asyncio.sleep(1)
-
-    async def end_interview(self):
-        """End the interview and generate summary"""
-        if self.interview and self.interview.status == 'active':
-            try:
-                print(f"🏁 Ending interview {self.interview.id}")
-                
-                self.interview.status = 'completed'
-                self.interview.ended_at = datetime.now()
-                
-                # Calculate duration
-                duration = self.interview.ended_at - self.interview.started_at
-                self.interview.duration_seconds = int(duration.total_seconds())
-                
-                # Generate transcript
-                interview_transcripts = [t for t in self.transcripts_db.values() 
-                                       if t.interview_id == self.interview.id]
-                interview_transcripts.sort(key=lambda x: x.sequence_number)
-                
-                full_transcript = '\n'.join([f"{t.speaker.upper()}: {t.text}" 
-                                           for t in interview_transcripts])
-                self.interview.full_transcript = full_transcript
-                
-                # Generate summary
-                print("📝 Generating interview summary...")
-                summary = await self.generate_summary(full_transcript)
-                self.interview.summary = summary
-                
-                # Send audio stream end
-                try:
-                    await self.send_audio_stream_end()
-                except:
-                    pass
-                
-                # Notify client
-                await self.websocket.send(json.dumps({
-                    'type': 'interview_ended',
-                    'interview_id': str(self.interview.id),
-                    'duration': self.interview.duration_formatted,
-                    'summary': summary,
-                    'total_transcripts': len(interview_transcripts)
-                }))
-                
-                print(f"✅ Interview completed - Duration: {self.interview.duration_formatted}, Transcripts: {len(interview_transcripts)}")
-                
-            except Exception as e:
-                print(f"❌ Error ending interview: {e}")
-                if self.interview:
-                    self.interview.status = 'failed'
-    
-    async def generate_summary(self, transcript: str) -> str:
-        """Generate interview summary"""
-        try:
-            if not transcript.strip():
-                return "No conversation content to summarize."
-            
-            api_key = os.environ.get("GEMINI_API_KEY")
-            genai_summary.configure(api_key=api_key)
-            model = genai_summary.GenerativeModel('gemini-1.5-flash')
-            
-            prompt = f"""
-            Please provide a concise summary of this interview conversation.
-            Focus on key topics, insights, and overall tone.
-            Keep it under 200 words.
-            
-            Transcript:
-            {transcript}
-            """
-            
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            return response.text.strip() if response.text else "Summary could not be generated."
-            
-        except Exception as e:
-            print(f"❌ Error generating summary: {e}")
-            return f"Summary generation failed: {str(e)}"
-
-# HTML content (same as before but with debug info)
+# HTML content with Web Speech API integration
 HTML_CONTENT = """
 <!DOCTYPE html>
 <html lang="en">
@@ -493,11 +68,13 @@ HTML_CONTENT = """
             <div id="summary" class="text-gray-700"></div>
         </div>
         
-        <!-- Debug info -->
+        <!-- Debug info with speech recognition status -->
         <div class="bg-gray-100 p-3 rounded-lg mt-5 text-xs">
-            <div>Status: <span id="debugStatus">Not connected</span></div>
-            <div>Audio chunks sent: <span id="audioChunks">0</span></div>
+            <div>WebSocket: <span id="debugStatus">Not connected</span></div>
+            <div>Speech Recognition: <span id="speechStatus">Not started</span></div>
+            <div>Server audio processing: <span class="text-green-600">Enabled (PyAudio)</span></div>
             <div>Responses received: <span id="responseCount">0</span></div>
+            <div>API Status: <span id="apiStatus">Not connected</span></div>
         </div>
         
         <audio id="audioPlayer" preload="auto"></audio>
@@ -507,15 +84,15 @@ HTML_CONTENT = """
         class WorkingInterviewApp {
             constructor() {
                 this.ws = null;
+                this.recognition = null;  // Added for Web Speech API
                 this.audioContext = null;
                 this.audioStream = null;
                 this.isRecording = false;
-                this.audioChunkCount = 0;
                 this.responseCount = 0;
-                this.audioBuffer = [];
-                this.currentStreamId = null;
-                this.isPlayingAudio = false;
-                this.audioTimeout = null;
+                
+                // Audio playback queue
+                this.audioQueue = [];
+                this.isPlaying = false;
                 
                 this.initializeElements();
                 this.initializeEventListeners();
@@ -532,8 +109,9 @@ HTML_CONTENT = """
                 
                 // Debug elements
                 this.debugStatus = document.getElementById('debugStatus');
-                this.audioChunksEl = document.getElementById('audioChunks');
+                this.speechStatus = document.getElementById('speechStatus');  // Added
                 this.responseCountEl = document.getElementById('responseCount');
+                this.apiStatus = document.getElementById('apiStatus');
             }
 
             initializeEventListeners() {
@@ -544,12 +122,17 @@ HTML_CONTENT = """
             async startInterview() {
                 try {
                     this.debugStatus.textContent = "Connecting...";
+                    this.apiStatus.textContent = "Connecting to Gemini...";
+                    
                     this.ws = new WebSocket('ws://localhost:8001');
                     
                     this.ws.onopen = () => {
                         console.log('WebSocket connected');
                         this.debugStatus.textContent = "Connected";
-                        this.updateStatus('Connected to Gemini Live...', 'active');
+                        this.updateStatus('Connected to server...', 'active');
+                        
+                        // Start speech recognition immediately after WebSocket connects
+                        this.startSpeechRecognition();
                     };
 
                     this.ws.onmessage = (event) => {
@@ -561,16 +144,20 @@ HTML_CONTENT = """
                     this.ws.onclose = () => {
                         console.log('WebSocket closed');
                         this.debugStatus.textContent = "Disconnected";
+                        this.apiStatus.textContent = "Disconnected";
+                        this.stopSpeechRecognition();
                         this.resetInterface();
                     };
 
                     this.ws.onerror = (error) => {
                         console.error('WebSocket error:', error);
                         this.debugStatus.textContent = "Error";
+                        this.apiStatus.textContent = "Connection failed";
                         this.updateStatus('Connection failed', 'idle');
                     };
 
-                    await this.setupAudioRecording();
+                    // Request microphone permission
+                    await this.requestMicrophonePermission();
                     
                 } catch (error) {
                     console.error('Error starting interview:', error);
@@ -578,9 +165,87 @@ HTML_CONTENT = """
                 }
             }
 
-            async setupAudioRecording() {
+            startSpeechRecognition() {
+                if ('webkitSpeechRecognition' in window || 'SpeechRecognition' in window) {
+                    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+                    this.recognition = new SpeechRecognition();
+                    
+                    this.recognition.continuous = true;
+                    this.recognition.interimResults = false;
+                    this.recognition.lang = 'en-US';
+                    this.recognition.maxAlternatives = 1;
+                    
+                    this.recognition.onstart = () => {
+                        console.log('Speech recognition started');
+                        this.speechStatus.textContent = "Listening...";
+                        this.speechStatus.className = "text-green-600";
+                    };
+                    
+                    this.recognition.onresult = (event) => {
+                        const last = event.results.length - 1;
+                        const transcript = event.results[last][0].transcript.trim();
+                        
+                        if (transcript) {
+                            console.log('User said:', transcript);
+                            this.addTranscript('user', transcript);
+                            
+                            // Send transcribed text to server so AI knows what was said
+                            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                                this.ws.send(JSON.stringify({
+                                    type: 'user_speech',
+                                    text: transcript
+                                }));
+                            }
+                        }
+                    };
+                    
+                    this.recognition.onerror = (event) => {
+                        console.log('Speech recognition error:', event.error);
+                        this.speechStatus.textContent = `Error: ${event.error}`;
+                        this.speechStatus.className = "text-red-600";
+                        
+                        // Restart recognition after error
+                        setTimeout(() => {
+                            if (this.recognition && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                                this.recognition.start();
+                            }
+                        }, 1000);
+                    };
+                    
+                    this.recognition.onend = () => {
+                        console.log('Speech recognition ended');
+                        // Auto-restart recognition if session is still active
+                        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                            setTimeout(() => {
+                                if (this.recognition) {
+                                    this.recognition.start();
+                                }
+                            }, 500);
+                        }
+                    };
+                    
+                    this.recognition.start();
+                    
+                } else {
+                    console.log('Speech recognition not supported');
+                    this.speechStatus.textContent = "Not supported";
+                    this.speechStatus.className = "text-yellow-600";
+                }
+            }
+
+            stopSpeechRecognition() {
+                if (this.recognition) {
+                    this.recognition.stop();
+                    this.recognition = null;
+                    this.speechStatus.textContent = "Stopped";
+                    this.speechStatus.className = "text-gray-600";
+                }
+            }
+
+            async requestMicrophonePermission() {
                 try {
-                    this.audioStream = await navigator.mediaDevices.getUserMedia({ 
+                    // Request permission for speech recognition
+                    const stream = await navigator.mediaDevices.getUserMedia({ 
                         audio: {
                             sampleRate: 16000,
                             channelCount: 1,
@@ -588,62 +253,39 @@ HTML_CONTENT = """
                             noiseSuppression: true
                         } 
                     });
-
-                    this.audioContext = new AudioContext({sampleRate: 16000});
-                    const source = this.audioContext.createMediaStreamSource(this.audioStream);
-                    const processor = this.audioContext.createScriptProcessor(1024, 1, 1);
-
-                    processor.onaudioprocess = (event) => {
-                        if (!this.isRecording) return;
-                        
-                        const inputBuffer = event.inputBuffer.getChannelData(0);
-                        if (inputBuffer.length < 128) return;
-                        
-                        const pcmData = this.floatTo16BitPCM(inputBuffer);
-                        const base64Audio = btoa(String.fromCharCode.apply(null, new Uint8Array(pcmData)));
-
-                        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                            this.ws.send(JSON.stringify({
-                                type: 'audio_chunk',
-                                audio: base64Audio
-                            }));
-                            
-                            this.audioChunkCount++;
-                            this.audioChunksEl.textContent = this.audioChunkCount;
-                        }
-                    };
-
-                    source.connect(processor);
-                    processor.connect(this.audioContext.destination);
-                    this.isRecording = true;
-
+                    
+                    // Close the stream immediately since server handles audio
+                    stream.getTracks().forEach(track => track.stop());
+                    
+                    console.log('Microphone permission granted');
+                    
                 } catch (error) {
-                    console.error('Error setting up audio:', error);
+                    console.error('Error requesting microphone permission:', error);
+                    this.updateStatus('Microphone permission denied', 'idle');
                     throw error;
                 }
-            }
-            
-            floatTo16BitPCM(input) {
-                const buffer = new ArrayBuffer(input.length * 2);
-                const view = new DataView(buffer);
-                for (let i = 0; i < input.length; i++) {
-                    const sample = Math.max(-1, Math.min(1, input[i]));
-                    view.setInt16(i * 2, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
-                }
-                return buffer;
             }
 
             stopInterview() {
                 if (this.ws && this.ws.readyState === WebSocket.OPEN) {
                     this.ws.send(JSON.stringify({ type: 'stop_interview' }));
                 }
+                this.stopSpeechRecognition();
                 this.cleanup();
             }
 
             cleanup() {
                 this.isRecording = false;
-                if (this.audioContext) this.audioContext.close();
-                if (this.audioStream) this.audioStream.getTracks().forEach(track => track.stop());
+                
+                // Stop speech recognition
+                this.stopSpeechRecognition();
+                
+                // Stop any playing audio
+                if (this.audioPlayer) {
+                    this.audioPlayer.pause();
+                    this.audioPlayer.src = '';
+                }
+                
                 if (this.ws) this.ws.close();
             }
 
@@ -661,6 +303,7 @@ HTML_CONTENT = """
                         this.startBtn.disabled = true;
                         this.stopBtn.disabled = false;
                         this.updateStatus('Interview in progress...', 'active');
+                        this.apiStatus.textContent = "Connected to Gemini Live";
                         this.transcripts.innerHTML = '';
                         break;
 
@@ -670,49 +313,29 @@ HTML_CONTENT = """
 
                     case 'audio_stream_start':
                         console.log('Audio stream starting');
-                        this.currentStreamId = data.stream_id;
-                        this.audioBuffer = []; // Reset buffer for new stream
-                        this.isPlayingAudio = false; // Reset playing state
                         break;
                         
                     case 'audio_chunk_response':
-                        if (data.stream_id === this.currentStreamId) {
-                            this.bufferAudioChunk(data.audio);
-                            
-                            // Clear any existing timeout
-                            if (this.audioTimeout) {
-                                clearTimeout(this.audioTimeout);
-                            }
-                            
-                            // Auto-play after accumulating enough audio (prevent infinite buffering)
-                            if (this.audioBuffer.length >= 3) { // Further reduced for more responsive audio
-                                this.playBufferedAudio();
-                            } else {
-                                // Set timeout to play audio even if stream end is missed
-                                this.audioTimeout = setTimeout(() => {
-                                    if (this.audioBuffer.length > 0) {
-                                        console.log('Audio timeout - playing buffered audio');
-                                        this.playBufferedAudio();
-                                    }
-                                }, 500); // Further reduced timeout for more responsive audio
-                            }
-                        }
+                        this.processAudioChunk(data.audio);
                         break;
                         
                     case 'audio_stream_end':
                         console.log('Audio stream ended');
-                        if (this.audioTimeout) {
-                            clearTimeout(this.audioTimeout);
-                            this.audioTimeout = null;
-                        }
-                        this.playBufferedAudio();
+                        this.playNextInQueue();
                         break;
 
                     case 'interview_ended':
-                        this.updateStatus(`Interview completed (${data.duration})`, 'completed');
-                        this.showSummary(data.summary);
+                        this.updateStatus(`Interview completed`, 'completed');
+                        this.apiStatus.textContent = "Session ended";
+                        this.showSummary(data.summary || "Interview completed successfully");
                         this.cleanup();
                         this.resetInterface();
+                        break;
+                        
+                    case 'error':
+                        this.updateStatus(`Error: ${data.message}`, 'idle');
+                        this.apiStatus.textContent = "API Error";
+                        console.error('Server error:', data.message);
                         break;
                 }
             }
@@ -734,14 +357,7 @@ HTML_CONTENT = """
                 this.transcripts.scrollTop = this.transcripts.scrollHeight;
             }
 
-            // DEPRECATED: This function causes choppy audio - now using buffering instead
-            playAudio(base64Audio) {
-                // This function is no longer used - kept for compatibility
-                console.warn('playAudio called but buffering system should be used instead');
-            }
-
-            // FIXED: Buffer audio chunks instead of playing immediately
-            bufferAudioChunk(base64Audio) {
+            processAudioChunk(base64Audio) {
                 try {
                     const audioData = atob(base64Audio);
                     const uint8Array = new Uint8Array(audioData.length);
@@ -750,68 +366,15 @@ HTML_CONTENT = """
                         uint8Array[i] = audioData.charCodeAt(i);
                     }
                     
-                    this.audioBuffer.push(uint8Array);
-                    console.log(`Buffered audio chunk: ${uint8Array.length} bytes (total: ${this.audioBuffer.length} chunks)`);
-                    
-                } catch (error) {
-                    console.error('Error buffering audio chunk:', error);
-                }
-            }
-
-            // Revamped: Play buffered audio with a proper queueing system to prevent jitter
-            playBufferedAudio() {
-                if (this.audioBuffer.length === 0 || this.isPlayingAudio) {
-                    return;
-                }
-
-                const chunksToPlay = this.audioBuffer;
-                this.audioBuffer = [];
-
-                try {
-                    console.log(`Playing ${chunksToPlay.length} audio chunks...`);
-                    this.isPlayingAudio = true;
-                    
-                    const totalLength = chunksToPlay.reduce((sum, chunk) => sum + chunk.length, 0);
-                    const combinedAudio = new Uint8Array(totalLength);
-                    
-                    let offset = 0;
-                    for (const chunk of chunksToPlay) {
-                        combinedAudio.set(chunk, offset);
-                        offset += chunk.length;
-                    }
-                    
-                    const wavBuffer = this.createWAVFromPCM(combinedAudio, 16000);
+                    const wavBuffer = this.createWAVFromPCM(uint8Array, 24000);
                     const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-                    const audioUrl = URL.createObjectURL(blob);
+                    this.audioQueue.push(blob);
                     
-                    this.audioPlayer.src = audioUrl;
-                    
-                    this.audioPlayer.onended = () => {
-                        URL.revokeObjectURL(audioUrl);
-                        this.isPlayingAudio = false;
-                        if (this.audioBuffer.length > 0) {
-                            this.playBufferedAudio();
-                        }
-                    };
-                    
-                    this.audioPlayer.onerror = (e) => {
-                        URL.revokeObjectURL(audioUrl);
-                        this.isPlayingAudio = false;
-                        console.error("Audio playback error:", e);
-                        if (this.audioBuffer.length > 0) {
-                            this.playBufferedAudio();
-                        }
-                    };
-                    
-                    this.audioPlayer.play().catch(e => {
-                        console.error("Error starting audio playback:", e);
-                        this.isPlayingAudio = false;
-                        this.audioPlayer.onerror(e); // Trigger error handling
-                    });
+                    // Start playing if not already playing
+                    this.playNextInQueue();
 
                 } catch (error) {
-                    console.error('Error playing buffered audio:', error);
-                    this.isPlayingAudio = false;
+                    console.error('Error processing audio chunk:', error);
                 }
             }
 
@@ -832,20 +395,44 @@ HTML_CONTENT = """
                 writeString(8, 'WAVE');
                 writeString(12, 'fmt ');
                 view.setUint32(16, 16, true);
-                view.setUint16(20, 1, true);
-                view.setUint16(22, 1, true);
+                view.setUint16(20, 1, true);   // PCM format
+                view.setUint16(22, 1, true);   // mono
                 view.setUint32(24, sampleRate, true);
-                view.setUint32(28, sampleRate * 2, true);
-                view.setUint16(32, 2, true);
-                view.setUint16(34, 16, true);
+                view.setUint32(28, sampleRate * 2, true);  // byte rate
+                view.setUint16(32, 2, true);   // block align
+                view.setUint16(34, 16, true);  // bits per sample
                 writeString(36, 'data');
                 view.setUint32(40, length, true);
                 
-                for (let i = 0; i < length; i++) {
-                    view.setUint8(44 + i, pcmData[i]);
+                const pcmInt16 = new Int16Array(length / 2);
+                for (let i = 0; i < length; i += 2) {
+                    pcmInt16[i/2] = (pcmInt16[i+1] << 8) | pcmData[i];
                 }
                 
+                new Uint8Array(buffer, 44).set(new Uint8Array(pcmInt16.buffer));
                 return buffer;
+            }
+
+            async playNextInQueue() {
+                if (this.isPlaying || this.audioQueue.length === 0) return;
+                
+                this.isPlaying = true;
+                const audioBlob = this.audioQueue.shift();
+                
+                try {
+                    this.audioPlayer.src = URL.createObjectURL(audioBlob);
+                    await this.audioPlayer.play();
+                    
+                    this.audioPlayer.onended = () => {
+                        URL.revokeObjectURL(this.audioPlayer.src);
+                        this.isPlaying = false;
+                        this.playNextInQueue();
+                    };
+                } catch (error) {
+                    console.error("Error playing audio:", error);
+                    this.isPlaying = false;
+                    this.playNextInQueue();
+                }
             }
 
             showSummary(summaryText) {
@@ -879,16 +466,15 @@ class CustomHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(HTML_CONTENT.encode())
         else:
-            self.send_response(404)
-            self.end_headers()
+            SimpleHTTPRequestHandler.do_GET(self)
 
 async def handle_websocket(websocket, path):
     """Handle WebSocket connections"""
     print(f"New WebSocket connection from {websocket.remote_address}")
     
     try:
-        handler = WorkingGeminiLiveHandler(websocket, interviews_db, transcripts_db)
-        await handler.start_interview()
+        handler = PureGeminiHandler(websocket, interviews_db, transcripts_db)
+        await handler.start_interview_session()
         
     except Exception as e:
         print(f"Error in WebSocket handler: {e}")
@@ -913,14 +499,16 @@ async def start_websocket_server():
 
 def main():
     print("Starting WORKING Gemini Live Interview Application...")
-    print("HTTP Server: http://localhost:8000")
-    print("WebSocket Server: ws://localhost:8001")
-    print("\n🔧 Key improvements:")
-    print("- Better error handling and validation")
-    print("- Initial AI greeting to start conversation") 
-    print("- Debug counters to track audio/responses")
-    print("- Improved transcription capture")
-    print("- More robust audio processing")
+    print("🌐 HTTP Server: http://localhost:8000")
+    print("🔌 WebSocket Server: ws://localhost:8001")
+    print("🎙️ Audio processing: Server-side (PyAudio)")
+    print("🗣️ Speech recognition: Client-side (Web Speech API)")
+    print()
+    print("Make sure you have:")
+    print("  - GEMINI_API_KEY environment variable set")
+    print("  - All dependencies installed (pip install -r requirements.txt)")
+    print("  - Microphone access enabled")
+    print()
     
     # Start HTTP server in thread
     http_thread = threading.Thread(target=start_http_server, daemon=True)
@@ -934,3 +522,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    

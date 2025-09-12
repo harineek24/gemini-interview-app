@@ -1,498 +1,282 @@
+#!/usr/bin/env python3
 """
-Fixed Gemini Live Handler with smooth audio and continuous responses
+Gemini Live Handler - COMPLETE VERSION with Web Speech API Integration
 """
 
 import asyncio
 import json
 import base64
-import traceback
 import os
-import uuid
-import time
-from datetime import datetime
-from typing import Optional
-from dotenv import load_dotenv
+import traceback
+import struct
+import pyaudio
+import numpy as np
 from google import genai
-import google.generativeai as genai_summary
 from google.genai import types
 
-# Load environment variables from .env file
-load_dotenv()
+# Audio constants
+CHUNK_SIZE = 1024
+FORMAT = pyaudio.paInt16
+CHANNELS = 1
+SEND_SAMPLE_RATE = 16000
+RECEIVE_SAMPLE_RATE = 24000
 
-class SimpleInterview:
-    def __init__(self):
-        self.id = str(uuid.uuid4())
-        self.status = 'active'
-        self.started_at = datetime.now()
-        self.ended_at = None
-        self.duration_seconds = 0
-        self.full_transcript = ""
-        self.summary = ""
-    
-    @property
-    def duration_formatted(self):
-        minutes = self.duration_seconds // 60
-        seconds = self.duration_seconds % 60
-        return f"{minutes}:{seconds:02d}"
-
-class SimpleTranscript:
-    def __init__(self, interview_id: str, speaker: str, text: str, sequence: int):
-        self.id = str(uuid.uuid4())
-        self.interview_id = interview_id
-        self.speaker = speaker
-        self.text = text
-        self.sequence_number = sequence
-        self.timestamp = datetime.now()
-
-class FixedGeminiLiveHandler:
-    def __init__(self, websocket, interviews_db: dict, transcripts_db: dict):
-        self.websocket = websocket
-        self.interview: Optional[SimpleInterview] = None
+class PureGeminiHandler:
+    def __init__(self, client_websocket, interviews_db: dict, transcripts_db: dict):
+        self.client_ws = client_websocket
         self.interviews_db = interviews_db
         self.transcripts_db = transcripts_db
         
-        # Get API key from environment
+        self.is_session_active = True
+        self.audio_input_stream = None
+        self.audio_output_stream = None
+        
+        # Async queues for audio processing
+        self.audio_out_queue = asyncio.Queue()  # Audio to send to Gemini
+        self.audio_in_queue = asyncio.Queue()   # Audio from Gemini to play
+        
+        # Initialize Gemini client
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable not set")
             
-        # Use v1alpha API version for Live API
-        self.client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
-        self.model = "gemini-2.5-flash-preview-native-audio-dialog"
-        self.transcript_counter = 0
-        self.session = None
-        self.conversation_inactive_threshold = 30
-        self.last_activity = None
-        self.end_conversation_task = None
+        self.client = genai.Client(api_key=api_key)
+        self.model = "gemini-live-2.5-flash-preview"
+        self.live_session = None
         
-        # FIXES: Audio streaming improvements
-        self.audio_buffer = asyncio.Queue()
-        self.last_audio_time = None
-        self.silence_threshold = 1.0  # seconds
-        self.is_session_active = True
-        self.pending_audio_chunks = []
-        self.audio_chunk_timeout = 0.1  # 100ms buffer before sending
-        
-    async def start_interview(self):
-        """Initialize the interview and start the Gemini Live session"""
-        # Create new interview record
-        self.interview = SimpleInterview()
-        self.interviews_db[self.interview.id] = self.interview
-        
-        await self.websocket.send(json.dumps({
-            'type': 'interview_started',
-            'interview_id': str(self.interview.id)
-        }))
-        
-        # FIXED: Better config for continuous conversation
-        config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction="""You are a professional AI interviewer conducting a live interview. 
-            Keep the conversation flowing naturally with follow-up questions. 
-            Speak clearly and naturally. Don't end the interview unless explicitly asked.
-            If there's silence, occasionally prompt the interviewee to continue or ask clarifying questions.""",
-            # FIXED: Enable input transcription for better handling
-            input_audio_transcription={}
-        )
-        
-        # Start Gemini Live session
+        # Initialize PyAudio
+        self.pa = pyaudio.PyAudio()
+
+    async def start_interview_session(self):
+        """Main entry point to start and manage the interview."""
         try:
-            async with self.client.aio.live.connect(model=self.model, config=config) as session:
-                self.session = session
-                self.last_activity = datetime.now()
-                self.is_session_active = True
+            print("🔄 Starting Gemini Live session...")
+            
+            # Start client message handler and Gemini session
+            tasks = [
+                asyncio.create_task(self.handle_client_messages()),
+                asyncio.create_task(self.manage_gemini_session())
+            ]
+            
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                print(f"Error in main tasks: {e}")
+                traceback.print_exc()
                 
-                print("✅ Gemini Live session started successfully")
-                
-                # FIXED: Better task management
-                tasks = [
-                    asyncio.create_task(self.handle_gemini_responses()),
-                    asyncio.create_task(self.handle_client_messages()),
-                    asyncio.create_task(self.monitor_inactivity()),
-                    asyncio.create_task(self.audio_sender()),  # NEW: Dedicated audio sender
-                    asyncio.create_task(self.audio_streamer())  # NEW: Smooth audio streaming
-                ]
-                
-                try:
-                    await asyncio.gather(*tasks)
-                except Exception as e:
-                    print(f"Error in session tasks: {e}")
-                finally:
-                    self.is_session_active = False
-                    await self.end_interview()
-                    
         except Exception as e:
-            print(f"Error connecting to Gemini: {e}")
+            print(f"❌ Error in interview session: {e}")
             traceback.print_exc()
-            raise e
+        finally:
+            await self.end_interview()
 
     async def handle_client_messages(self):
-        """Handle messages from the client (user audio/commands)"""
+        """Listen for messages from the browser."""
         try:
-            async for message in self.websocket:
+            # Send interview started message
+            await self.client_ws.send(json.dumps({
+                'type': 'interview_started', 
+                'interview_id': 'gemini-live-interview'
+            }))
+            
+            async for message in self.client_ws:
                 if not self.is_session_active:
                     break
+                try:
+                    data = json.loads(message)
                     
-                data = json.loads(message)
-                
-                if data['type'] == 'audio_chunk':
-                    # FIXED: Better audio handling
-                    try:
-                        audio_data = base64.b64decode(data['audio'])
-                        if len(audio_data) > 0:
-                            # Add to pending chunks for batching
-                            self.pending_audio_chunks.append(audio_data)
-                            self.last_audio_time = time.time()
-                            self.last_activity = datetime.now()
-                    except Exception as e:
-                        print(f"Error processing audio chunk: {e}")
+                    if data.get('type') == 'stop_interview':
+                        print("🛑 User requested interview stop.")
+                        self.is_session_active = False
+                        break
                     
-                elif data['type'] == 'stop_interview':
-                    print("🛑 User requested interview stop")
-                    self.is_session_active = False
-                    await self.end_interview()
-                    break
-                    
-                elif data['type'] == 'text_input':
-                    # Handle text input
-                    await self.session.send_realtime_input(text=data['text'])
-                    await self.save_live_transcript('user', data['text'])
-                    self.last_activity = datetime.now()
+                    # NEW: Handle user speech from Web Speech API
+                    elif data.get('type') == 'user_speech':
+                        user_text = data.get('text', '').strip()
+                        if user_text:
+                            print(f"🗣️ User speech received: '{user_text}'")
+                            # Send text to Gemini so it can understand and respond
+                            if self.live_session:
+                                await self.live_session.send(input=user_text, end_of_turn=True)
+                                print(f"📤 Sent user text to Gemini: '{user_text}'")
+                            
+                except json.JSONDecodeError:
+                    print(f"Warning: Invalid JSON from client: {message}")
                     
         except Exception as e:
             print(f"Error handling client messages: {e}")
             self.is_session_active = False
     
-    async def audio_sender(self):
-        """NEW: Dedicated audio sender with batching to reduce choppiness"""
-        while self.is_session_active:
-            try:
-                # Check if we have pending audio and enough time has passed
-                if (self.pending_audio_chunks and self.last_audio_time and 
-                    time.time() - self.last_audio_time > self.audio_chunk_timeout):
-                    
-                    # Combine multiple small chunks to reduce overhead
-                    combined_audio = b''.join(self.pending_audio_chunks)
-                    self.pending_audio_chunks.clear()
-                    
-                    if len(combined_audio) > 0:
-                        await self.send_audio_to_gemini(combined_audio)
-                
-                # Check for silence and send stream end
-                elif (self.last_audio_time and 
-                      time.time() - self.last_audio_time > self.silence_threshold):
-                    await self.send_audio_stream_end()
-                    self.last_audio_time = None  # Reset to avoid repeated stream ends
-                
-                await asyncio.sleep(0.05)  # 50ms check interval
-                
-            except Exception as e:
-                print(f"Error in audio sender: {e}")
-                await asyncio.sleep(0.1)
-    
-    async def handle_gemini_responses(self):
-        """Handle responses from Gemini Live API"""
+    async def manage_gemini_session(self):
+        """Connect to Gemini and manage the live session."""
         try:
-            async for response in self.session.receive():
-                if not self.is_session_active:
-                    break
-                    
-                if hasattr(response, 'server_content') and response.server_content:
-                    
-                    # FIXED: Handle input transcription (user speech recognition)
-                    if hasattr(response.server_content, 'input_transcription') and response.server_content.input_transcription:
-                        user_text = response.server_content.input_transcription.text
-                        if user_text:
-                            await self.save_live_transcript('user', user_text)
-                            await self.websocket.send(json.dumps({
-                                'type': 'live_transcript',
-                                'speaker': 'user',
-                                'text': user_text
-                            }))
-                    
-                    # Handle interruptions
-                    if (hasattr(response.server_content, 'interrupted') and 
-                        response.server_content.interrupted):
-                        print("🤚 AI response interrupted")
-                        # Clear audio buffer on interruption
-                        while not self.audio_buffer.empty():
-                            try:
-                                self.audio_buffer.get_nowait()
-                            except:
-                                break
-                    
-                    # Handle model turn with audio/text content
-                    if hasattr(response.server_content, 'model_turn') and response.server_content.model_turn:
-                        for part in response.server_content.model_turn.parts:
-                            
-                            # Handle text responses (for transcription)
-                            if hasattr(part, 'text') and part.text:
-                                await self.save_live_transcript('ai', part.text)
-                                await self.websocket.send(json.dumps({
-                                    'type': 'live_transcript',
-                                    'speaker': 'ai',
-                                    'text': part.text
-                                }))
-                            
-                            # FIXED: Handle audio responses with buffering
-                            if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.data:
-                                # Queue audio for smooth streaming
-                                await self.audio_buffer.put({
-                                    'data': part.inline_data.data,
-                                    'mime_type': getattr(part.inline_data, 'mime_type', 'audio/pcm')
-                                })
-                    
-                    # Handle turn complete
-                    if hasattr(response.server_content, 'turn_complete') and response.server_content.turn_complete:
-                        print("✅ AI response complete")
-                        # Signal end of audio stream for this turn
-                        await self.audio_buffer.put({'end_turn': True})
-                    
-                    self.last_activity = datetime.now()
-                    
+            print("🔗 Connecting to Gemini Live API...")
+            
+            # Enhanced config for better conversation flow
+            config = {
+                "response_modalities": ["AUDIO"],               # Audio responses only
+                "output_audio_transcription": {},              # Get AI speech transcripts
+                "generation_config": {
+                    "temperature": 0.8,                        # Make responses more conversational
+                    "max_output_tokens": 1000,
+                },
+                "system_instruction": {
+                    "parts": [{
+                        "text": """You are an AI interviewer conducting a professional interview. Your role is to:
+                        1. Ask follow-up questions based on what the candidate says
+                        2. Keep the conversation flowing naturally
+                        3. Ask about their experience, skills, and background
+                        4. Be conversational but professional
+                        5. Always respond to what they tell you with relevant follow-up questions
+                        
+                        After each response from the candidate, ask a relevant follow-up question to keep the interview going."""
+                    }]
+                }
+            }
+            
+            print(f"🔄 Connecting with model: {self.model} (Audio + Web Speech API)")
+            
+            async with self.client.aio.live.connect(model=self.model, config=config) as session:
+                self.live_session = session
+                print("✅ Connected to Gemini Live API")
+                
+                # Send initial prompt
+                await session.send(input="Hello! Please introduce yourself and tell me about your background.", end_of_turn=True)
+                
+                # Start audio processing tasks (no need for microphone input now)
+                print("🚀 Starting audio processing tasks...")
+                
+                audio_tasks = await asyncio.gather(
+                    asyncio.create_task(self.receive_audio()),
+                    asyncio.create_task(self.play_audio()),
+                    return_exceptions=True
+                )
+                
+                print("🏁 Audio tasks completed")
+                
         except Exception as e:
-            print(f"Error handling Gemini responses: {e}")
+            print(f"❌ Error in Gemini session: {e}")
+            await self.client_ws.send(json.dumps({
+                'type': 'error',
+                'message': f"Gemini API Error: {str(e)}"
+            }))
             traceback.print_exc()
-    
-    async def audio_streamer(self):
-        """NEW: Stream audio smoothly to client with proper buffering"""
-        current_stream_id = None
-        
-        while self.is_session_active:
-            try:
-                # Wait for audio data with timeout
-                audio_item = await asyncio.wait_for(self.audio_buffer.get(), timeout=0.1)
-                
-                if audio_item.get('end_turn'):
-                    # Send end of turn signal
-                    if current_stream_id:
-                        await self.websocket.send(json.dumps({
-                            'type': 'audio_stream_end',
-                            'stream_id': current_stream_id
-                        }))
-                        current_stream_id = None
-                    continue
-                
-                # Start new audio stream
-                if not current_stream_id:
-                    current_stream_id = str(uuid.uuid4())
-                    await self.websocket.send(json.dumps({
-                        'type': 'audio_stream_start',
-                        'stream_id': current_stream_id,
-                        'sample_rate': 24000,  # Gemini native audio outputs at 24kHz
-                        'format': 'pcm_16'
-                    }))
-                
-                # Send audio chunk with stream ID
-                audio_b64 = base64.b64encode(audio_item['data']).decode()
-                await self.websocket.send(json.dumps({
-                    'type': 'audio_chunk_response',
-                    'stream_id': current_stream_id,
-                    'audio': audio_b64,
-                    'mime_type': audio_item.get('mime_type', 'audio/pcm')
-                }))
-                
-            except asyncio.TimeoutError:
-                continue  # No audio to stream, continue waiting
-            except Exception as e:
-                print(f"Error in audio streamer: {e}")
-                await asyncio.sleep(0.1)
-    
-    async def send_audio_to_gemini(self, audio_data: bytes):
-        """Send audio data to Gemini Live API"""
+        finally:
+            self.live_session = None
+
+    async def receive_audio(self):
+        """Receive responses from Gemini with transcription support."""
         try:
-            # FIXED: Less restrictive validation
-            if len(audio_data) == 0:
+            print("👂 Audio receiver ready, waiting for Gemini...")
+            
+            if not self.live_session:
+                print("❌ No live session available for receiving")
                 return
                 
-            # Don't reject valid audio chunks - just log if unusually large
-            if len(audio_data) > 65536:  # 64KB warning threshold
-                print(f"Warning: Large audio chunk ({len(audio_data)} bytes)")
-            
-            # Send audio using the working method
-            await self.session.send_realtime_input(
-                audio=types.Blob(
-                    data=audio_data,
-                    mime_type="audio/pcm;rate=16000"
-                )
-            )
-            
+            async for response in self.live_session.receive():
+                if not self.is_session_active:
+                    break
+
+                # Handle server content
+                if hasattr(response, 'server_content') and response.server_content:
+                    server_content = response.server_content
+                    
+                    # Handle OUTPUT transcription (AI speech)
+                    if (hasattr(server_content, 'output_transcription') and 
+                        server_content.output_transcription and
+                        hasattr(server_content.output_transcription, 'text')):
+                        
+                        ai_text = server_content.output_transcription.text
+                        if ai_text.strip():
+                            print(f"🤖 AI said: '{ai_text}'")
+                            await self.client_ws.send(json.dumps({
+                                'type': 'live_transcript',
+                                'speaker': 'ai',
+                                'text': ai_text
+                            }))
+                    
+                    # Handle AI audio responses
+                    if (hasattr(server_content, 'model_turn') and 
+                        server_content.model_turn and
+                        hasattr(server_content.model_turn, 'parts')):
+                        
+                        for part in server_content.model_turn.parts:
+                            # Handle audio data
+                            if (hasattr(part, 'inline_data') and 
+                                part.inline_data and
+                                hasattr(part.inline_data, 'data')):
+                                
+                                audio_data = part.inline_data.data
+                                print(f"🔊 Received audio ({len(audio_data)} bytes)")
+                                # Queue for playback
+                                await self.audio_in_queue.put(audio_data)
+                    
+                    # Handle turn completion
+                    if hasattr(server_content, 'turn_complete') and server_content.turn_complete:
+                        print("✅ AI finished speaking")
+                
         except Exception as e:
-            print(f"Error sending audio to Gemini: {e}")
-            print(f"Audio data length: {len(audio_data) if audio_data else 'None'}")
+            print(f"❌ Error receiving from Gemini: {e}")
             traceback.print_exc()
 
-    async def send_audio_stream_end(self):
-        """Send audio stream end to flush cached audio"""
+    async def play_audio(self):
+        """Play audio responses from Gemini."""
         try:
-            await self.session.send_realtime_input(audio_stream_end=True)
-            print("📤 Sent audio stream end")
-        except Exception as e:
-            print(f"Error sending audio stream end: {e}")
-
-    async def save_live_transcript(self, speaker: str, text: str):
-        """Save live transcript to simple storage"""
-        try:
-            if self.interview and text.strip():
-                transcript = SimpleTranscript(
-                    self.interview.id, 
-                    speaker, 
-                    text.strip(), 
-                    self.transcript_counter
-                )
-                self.transcripts_db[transcript.id] = transcript
-                self.transcript_counter += 1
-                print(f"💾 Saved transcript: {speaker} -> {text[:50]}...")
-        except Exception as e:
-            print(f"Error saving transcript: {e}")
-    
-    async def monitor_inactivity(self):
-        """Monitor for conversation inactivity to auto-end"""
-        while self.is_session_active:
-            try:
-                await asyncio.sleep(5)  # Check every 5 seconds
-                
-                if self.last_activity:
-                    inactive_seconds = (datetime.now() - self.last_activity).total_seconds()
+            print("🔊 Setting up audio playback...")
+            
+            # Open output stream
+            self.audio_output_stream = await asyncio.to_thread(
+                self.pa.open,
+                format=FORMAT,
+                channels=CHANNELS,
+                rate=RECEIVE_SAMPLE_RATE,
+                output=True,
+            )
+            
+            print("🔊 Audio playback ready")
+            
+            while self.is_session_active:
+                try:
+                    # Get audio from queue
+                    audio_data = await self.audio_in_queue.get()
                     
-                    if inactive_seconds > self.conversation_inactive_threshold:
-                        print(f"⏰ Conversation inactive for {inactive_seconds:.1f}s, ending interview")
-                        self.is_session_active = False
-                        await self.end_interview()
-                        break
-                        
-            except Exception as e:
-                print(f"Error in inactivity monitor: {e}")
-                await asyncio.sleep(1)
-
-    async def end_interview(self):
-        """End the interview and generate summary"""
-        if self.interview and self.interview.status == 'active':
-            try:
-                print(f"🏁 Ending interview {self.interview.id}")
-                
-                # Update interview status
-                self.interview.status = 'completed'
-                self.interview.ended_at = datetime.now()
-                
-                # Calculate duration
-                duration = self.interview.ended_at - self.interview.started_at
-                self.interview.duration_seconds = int(duration.total_seconds())
-                
-                # Generate full transcript
-                interview_transcripts = [t for t in self.transcripts_db.values() 
-                                       if t.interview_id == self.interview.id]
-                interview_transcripts.sort(key=lambda x: x.sequence_number)
-                
-                full_transcript = '\n'.join([f"{t.speaker.upper()}: {t.text}" 
-                                           for t in interview_transcripts])
-                self.interview.full_transcript = full_transcript
-                
-                # Generate summary using Gemini (non-live API)
-                print("📝 Generating interview summary...")
-                summary = await self.generate_summary(full_transcript)
-                self.interview.summary = summary
-                
-                # Send final audio stream end
-                try:
-                    await self.send_audio_stream_end()
-                except:
-                    pass
-                
-                # Notify client
-                await self.websocket.send(json.dumps({
-                    'type': 'interview_ended',
-                    'interview_id': str(self.interview.id),
-                    'duration': self.interview.duration_formatted,
-                    'summary': summary,
-                    'total_transcripts': len(interview_transcripts)
-                }))
-                
-                print(f"✅ Interview {self.interview.id} completed successfully")
-                print(f"   Duration: {self.interview.duration_formatted}")
-                print(f"   Transcripts: {len(interview_transcripts)}")
-                
-            except Exception as e:
-                print(f"❌ Error ending interview: {e}")
-                traceback.print_exc()
-                if self.interview:
-                    self.interview.status = 'failed'
-                
-                # Still notify client of end
-                try:
-                    await self.websocket.send(json.dumps({
-                        'type': 'interview_ended',
-                        'interview_id': str(self.interview.id) if self.interview else 'unknown',
-                        'duration': '0:00',
-                        'summary': 'Interview ended with errors.',
-                        'error': str(e)
+                    # Play locally
+                    await asyncio.to_thread(self.audio_output_stream.write, audio_data)
+                    
+                    # Also send to browser
+                    audio_b64 = base64.b64encode(audio_data).decode('ascii')
+                    await self.client_ws.send(json.dumps({
+                        'type': 'audio_chunk_response',
+                        'audio': audio_b64
                     }))
-                except:
-                    pass
-    
-    async def generate_summary(self, transcript: str) -> str:
-        """Generate interview summary using Gemini"""
-        try:
-            if not transcript.strip():
-                return "No conversation content to summarize."
-            
-            # Use regular Gemini API for summary generation
-            api_key = os.environ.get("GEMINI_API_KEY")
-            genai_summary.configure(api_key=api_key)
-            model = genai_summary.GenerativeModel('gemini-1.5-flash')
-            
-            prompt = f"""
-            Please provide a concise and professional summary of this interview conversation.
-            
-            Focus on:
-            - Key topics and themes discussed
-            - Main insights or information shared
-            - Overall tone and flow of the conversation
-            - Any notable highlights or important points
-            
-            Keep the summary under 200 words and make it useful for someone who wasn't present.
-            
-            Interview Transcript:
-            {transcript}
-            """
-            
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            summary_text = response.text.strip()
-            
-            if summary_text:
-                print(f"✅ Generated summary ({len(summary_text)} chars)")
-                return summary_text
-            else:
-                return "Summary could not be generated from the conversation."
-            
-        except Exception as e:
-            print(f"❌ Error generating summary: {e}")
-            return f"Summary generation failed due to an error: {str(e)}"
-
-    async def cleanup(self):
-        """Clean up resources"""
-        try:
-            self.is_session_active = False
-            
-            # Clear audio buffer
-            while not self.audio_buffer.empty():
-                try:
-                    self.audio_buffer.get_nowait()
-                except:
+                    
+                    print("▶️ Played audio chunk")
+                    
+                except Exception as e:
+                    print(f"Error playing audio: {e}")
                     break
             
-            # Clear pending audio chunks
-            self.pending_audio_chunks.clear()
-            
-            print("🧹 Cleanup completed")
-            
         except Exception as e:
-            print(f"Error during cleanup: {e}")
+            print(f"❌ Error setting up audio playback: {e}")
+            traceback.print_exc()
+        finally:
+            if self.audio_output_stream:
+                try:
+                    await asyncio.to_thread(self.audio_output_stream.stop_stream)
+                    await asyncio.to_thread(self.audio_output_stream.close)
+                except:
+                    pass
+            print("🔊 Audio playback stopped")
 
-    def __del__(self):
-        """Destructor to ensure cleanup"""
+    async def end_interview(self):
+        """Clean up all resources."""
+        print("🏁 Ending interview session...")
+        self.is_session_active = False
+        
+        # Clean up PyAudio
         try:
-            if hasattr(self, 'is_session_active'):
-                self.is_session_active = False
+            await asyncio.to_thread(self.pa.terminate)
         except:
             pass
+        
+        print("✅ Interview session ended cleanly")
